@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="color-scheme" content="light dark">
+<title>spTYRO</title>
+<style>
+:root{
+  --paper:#F2F4F7; --ink:#0F1317; --mute:#66707C; --rule:#D3D8DF; --signal:#1F4FFF;
+  --sans:system-ui,"Roboto","Segoe UI",sans-serif;
+  --cond:"sans-serif-condensed","Roboto Condensed","Arial Narrow",system-ui,sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root{--paper:#0E1115; --ink:#EDF0F4; --mute:#8C96A3; --rule:#222931; --signal:#7DA2FF}
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{
+  background:var(--paper);color:var(--ink);font:16px/1.4 var(--sans);
+  height:100dvh;display:flex;flex-direction:column;
+  padding:env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+}
+header{display:flex;align-items:baseline;gap:.8rem;padding:.9rem 1.1rem .7rem;border-bottom:1px solid var(--rule)}
+.brand{font:800 1.55rem/1 var(--cond);letter-spacing:-.01em}
+#status{flex:1;color:var(--mute);font-size:.85rem}
+#mode{background:none;border:1px solid var(--rule);color:var(--ink);font:inherit;font-size:.8rem;padding:.3rem .75rem;border-radius:999px}
+main{flex:1;overflow-y:auto;padding:.4rem 1.1rem 1.5rem;overscroll-behavior:contain}
+.empty{color:var(--mute);margin:1.6rem 0}
+.ex{padding:1rem 0;border-bottom:1px solid var(--rule)}
+.q{margin:0;color:var(--mute);font-size:.95rem;overflow-wrap:anywhere}
+.a{margin:.25rem 0 0;font:700 1.25rem/1.2 var(--sans);overflow-wrap:anywhere;white-space:pre-wrap}
+.ex:first-of-type .a{font:800 clamp(2.8rem,17vw,5.5rem)/.95 var(--cond);letter-spacing:-.02em}
+.ex:first-of-type .a.long{font:700 clamp(1.5rem,7vw,2.2rem)/1.15 var(--sans);letter-spacing:0}
+.m{margin:.5rem 0 0;color:var(--mute);font-size:.78rem}
+.live::after{content:"";display:inline-block;width:.07em;height:.85em;margin-left:.05em;background:var(--signal);vertical-align:-.05em;animation:blink 1s steps(2,start) infinite}
+@keyframes blink{50%{opacity:0}}
+@media (prefers-reduced-motion:reduce){.live::after{animation:none}}
+footer{display:flex;gap:.6rem;padding:.7rem 1.1rem calc(.7rem + env(safe-area-inset-bottom));border-top:1px solid var(--rule);background:var(--paper)}
+#q{flex:1;min-width:0;font:inherit;font-size:1.05rem;color:var(--ink);background:transparent;border:1px solid var(--rule);border-radius:.6rem;padding:.75rem .9rem}
+#send{font:700 1rem var(--sans);background:var(--ink);color:var(--paper);border:0;border-radius:.6rem;padding:0 1.2rem}
+#q:focus-visible,#send:focus-visible,#mode:focus-visible{outline:2px solid var(--signal);outline-offset:2px}
+#send:disabled,#q:disabled{opacity:.45}
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">spAI</span>
+  <span id="status">spTYRO · loading</span>
+  <button id="mode" type="button" aria-label="Sampling mode">precise</button>
+</header>
+<main id="log">
+  <p class="empty" id="empty">Ask something. You get the answer, nothing else.</p>
+</main>
+<footer>
+  <input id="q" type="text" placeholder="Ask" autocomplete="off" autocapitalize="sentences" enterkeyhint="send" disabled>
+  <button id="send" type="button" disabled>Ask</button>
+</footer>
+
+<script>
+/*RT-START*/
+// ---- fp16 -> fp32 lookup -------------------------------------------------
+const F16 = new Float32Array(65536);
+for (let h = 0; h < 65536; h++) {
+  const s = h & 0x8000 ? -1 : 1, e = (h >> 10) & 31, m = h & 1023;
+  F16[h] = e === 0 ? s * m * 5.960464477539063e-8
+         : e === 31 ? (m ? NaN : s * Infinity)
+         : s * (1 + m / 1024) * Math.pow(2, e - 15);
+}
+
+// ---- byte-level BPE (matches the Python `tokenizers` pipeline) -----------
+function makeBPE(tj, nSpecial) {
+  const vocab = tj.vocab, rank = new Map(), id2tok = [];
+  tj.merges.forEach((m, i) => rank.set(m, i));
+  for (const k in vocab) id2tok[vocab[k]] = k;
+  const bs = [];
+  for (let i = 33; i <= 126; i++) bs.push(i);
+  for (let i = 161; i <= 172; i++) bs.push(i);
+  for (let i = 174; i <= 255; i++) bs.push(i);
+  const cs = bs.slice(); let n = 0;
+  for (let b = 0; b < 256; b++) if (!bs.includes(b)) { bs.push(b); cs.push(256 + n); n++; }
+  const b2u = new Array(256), u2b = new Map();
+  bs.forEach((b, i) => { const ch = String.fromCodePoint(cs[i]); b2u[b] = ch; u2b.set(ch, b); });
+  const RE = /'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+/gu;
+  const NUM = /\p{N}/u;
+  const enc = new TextEncoder(), dec = new TextDecoder('utf-8');
+  const cache = new Map();
+  function bpe(word) {
+    const hit = cache.get(word); if (hit) return hit;
+    const p = Array.from(word);
+    while (p.length > 1) {
+      let best = Infinity, bi = -1;
+      for (let i = 0; i < p.length - 1; i++) {
+        const r = rank.get(p[i] + ' ' + p[i + 1]);
+        if (r !== undefined && r < best) { best = r; bi = i; }
+      }
+      if (bi < 0) break;
+      p.splice(bi, 2, p[bi] + p[bi + 1]);
+    }
+    cache.set(word, p);
+    return p;
+  }
+  function pieces(text) {
+    const out = []; let buf = '';
+    const flush = () => { if (buf) { for (const m of buf.matchAll(RE)) out.push(m[0]); buf = ''; } };
+    for (const ch of text) { if (NUM.test(ch)) { flush(); out.push(ch); } else buf += ch; }
+    flush();
+    return out;
+  }
+  function encode(text) {
+    const ids = [];
+    for (const piece of pieces(text)) {
+      let w = ''; for (const b of enc.encode(piece)) w += b2u[b];
+      for (const t of bpe(w)) { const id = vocab[t]; if (id !== undefined) ids.push(id); }
+    }
+    return ids;
+  }
+  function decode(ids) {
+    const bytes = [];
+    for (const id of ids) {
+      if (id < nSpecial) continue;
+      const t = id2tok[id]; if (t === undefined) continue;
+      for (const ch of t) { const b = u2b.get(ch); if (b !== undefined) bytes.push(b); }
+    }
+    return dec.decode(new Uint8Array(bytes));
+  }
+  return { encode, decode };
+}
+
+// ---- weights ---------------------------------------------------------------
+function parseWeights(cfg, tensors, bytes) {
+  const get = (name) => {
+    const t = tensors.find((x) => x.name === name);
+    const n = t.shape.reduce((a, b) => a * b, 1);
+    const u = new Uint16Array(bytes.slice(t.offset, t.offset + 2 * n).buffer);
+    const f = new Float32Array(n);
+    for (let i = 0; i < n; i++) f[i] = F16[u[i]];
+    return f;
+  };
+  const W = { wte: get('wte'), wpe: get('wpe'), lnf: get('lnf'), blocks: [] };
+  for (let l = 0; l < cfg.n_layer; l++) {
+    W.blocks.push({ ln1: get(`l${l}.ln1`), qkv: get(`l${l}.qkv`), proj: get(`l${l}.proj`),
+                    ln2: get(`l${l}.ln2`), fc: get(`l${l}.fc`), mproj: get(`l${l}.mproj`) });
+  }
+  return W;
+}
+
+// ---- transformer (one token at a time, with KV cache) -------------------------
+function lnorm(out, x, w, n) {
+  let m = 0; for (let i = 0; i < n; i++) m += x[i]; m /= n;
+  let v = 0; for (let i = 0; i < n; i++) { const d = x[i] - m; v += d * d; } v /= n;
+  const inv = 1 / Math.sqrt(v + 1e-5);
+  for (let i = 0; i < n; i++) out[i] = (x[i] - m) * inv * w[i];
+}
+function matvec(out, Wt, rows, cols, x) {  // Wt is row-major [rows, cols]
+  for (let r = 0, base = 0; r < rows; r++, base += cols) {
+    let s = 0; for (let c = 0; c < cols; c++) s += Wt[base + c] * x[c];
+    out[r] = s;
+  }
+}
+const gelu = (x) => 0.5 * x * (1 + Math.tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
+
+class Net {
+  constructor(cfg, W) {
+    this.c = cfg; this.W = W; const d = cfg.n_embd;
+    this.kc = []; this.vc = [];
+    for (let l = 0; l < cfg.n_layer; l++) {
+      this.kc.push(new Float32Array(cfg.block_size * d));
+      this.vc.push(new Float32Array(cfg.block_size * d));
+    }
+    this.x = new Float32Array(d); this.h = new Float32Array(d); this.tmp = new Float32Array(d);
+    this.qkv = new Float32Array(3 * d); this.att = new Float32Array(d); this.u = new Float32Array(4 * d);
+    this.sc = new Float32Array(cfg.block_size); this.logits = new Float32Array(cfg.vocab_size);
+    this.pos = 0;
+  }
+  reset() { this.pos = 0; }
+  step(tok, wantLogits) {
+    const { n_layer: L, n_head: H, n_embd: d, block_size: T, vocab_size: V } = this.c;
+    const hd = d / H, W = this.W, pos = this.pos;
+    if (pos >= T) throw new Error('context full');
+    const { x, h, tmp, qkv, att, u, sc } = this;
+    for (let i = 0; i < d; i++) x[i] = W.wte[tok * d + i] + W.wpe[pos * d + i];
+    const scale = 1 / Math.sqrt(hd);
+    for (let l = 0; l < L; l++) {
+      const B = W.blocks[l], kc = this.kc[l], vc = this.vc[l];
+      lnorm(h, x, B.ln1, d);
+      matvec(qkv, B.qkv, 3 * d, d, h);
+      for (let i = 0; i < d; i++) { kc[pos * d + i] = qkv[d + i]; vc[pos * d + i] = qkv[2 * d + i]; }
+      for (let hh = 0; hh < H; hh++) {
+        const ho = hh * hd; let mx = -Infinity;
+        for (let t = 0; t <= pos; t++) {
+          let s = 0; const ko = t * d + ho;
+          for (let j = 0; j < hd; j++) s += qkv[ho + j] * kc[ko + j];
+          s *= scale; sc[t] = s; if (s > mx) mx = s;
+        }
+        let sum = 0;
+        for (let t = 0; t <= pos; t++) { const e = Math.exp(sc[t] - mx); sc[t] = e; sum += e; }
+        const inv = 1 / sum;
+        for (let j = 0; j < hd; j++) att[ho + j] = 0;
+        for (let t = 0; t <= pos; t++) {
+          const w = sc[t] * inv, vo = t * d + ho;
+          for (let j = 0; j < hd; j++) att[ho + j] += w * vc[vo + j];
+        }
+      }
+      matvec(tmp, B.proj, d, d, att);
+      for (let i = 0; i < d; i++) x[i] += tmp[i];
+      lnorm(h, x, B.ln2, d);
+      matvec(u, B.fc, 4 * d, d, h);
+      for (let i = 0; i < 4 * d; i++) u[i] = gelu(u[i]);
+      matvec(tmp, B.mproj, d, 4 * d, u);
+      for (let i = 0; i < d; i++) x[i] += tmp[i];
+    }
+    this.pos++;
+    if (!wantLogits) return null;
+    lnorm(h, x, W.lnf, d);
+    matvec(this.logits, W.wte, V, d, h);
+    return this.logits;
+  }
+}
+
+// ---- sampling + generation ---------------------------------------------------
+function pickToken(lg, temp, topK) {
+  const V = lg.length;
+  if (temp <= 0) {
+    let b = 0, bv = -Infinity;
+    for (let i = 0; i < V; i++) if (lg[i] > bv) { bv = lg[i]; b = i; }
+    return b;
+  }
+  const idx = new Array(V); for (let i = 0; i < V; i++) idx[i] = i;
+  idx.sort((a, b) => lg[b] - lg[a]);
+  const k = Math.min(topK, V), mx = lg[idx[0]]; let sum = 0; const p = new Array(k);
+  for (let i = 0; i < k; i++) { p[i] = Math.exp((lg[idx[i]] - mx) / temp); sum += p[i]; }
+  let r = Math.random() * sum;
+  for (let i = 0; i < k; i++) { r -= p[i]; if (r <= 0) return idx[i]; }
+  return idx[k - 1];
+}
+const tick = () => new Promise((r) => setTimeout(r, 0));
+
+async function generate(net, bpe, sp, prompt, o = {}) {
+  const maxNew = Math.min(o.maxNew ?? 64, net.c.block_size >> 1), temp = o.temp ?? 0, topK = o.topK ?? 20;
+  let ids = [sp.user, ...bpe.encode(prompt.trim()), sp.bot];
+  const limit = net.c.block_size - maxNew;
+  if (ids.length > limit) ids = [sp.user, ...ids.slice(ids.length - (limit - 1))];
+  const t0 = performance.now();
+  net.reset();
+  let logits = null;
+  for (let i = 0; i < ids.length; i++) {
+    logits = net.step(ids[i], i === ids.length - 1);
+    if (i % 4 === 3) await tick();
+  }
+  const out = [];
+  for (let n = 0; n < maxNew; n++) {
+    const nx = pickToken(logits, temp, topK);
+    if (nx === sp.end || nx === sp.eot || nx === sp.user || nx === sp.bot) break;
+    out.push(nx);
+    if (o.onToken) o.onToken(bpe.decode(out));
+    if (net.pos >= net.c.block_size) break;
+    logits = net.step(nx, true);
+    await tick();
+  }
+  return { text: bpe.decode(out), tokens: out.length, ms: performance.now() - t0 };
+}
+/*RT-END*/
+
+// ---- UI ------------------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+const logEl = $('log'), input = $('q'), sendBtn = $('send'), statusEl = $('status'), modeBtn = $('mode');
+let net = null, bpe = null, sp = null, busy = false, mode = 'precise';
+
+const setStatus = (t) => { statusEl.textContent = 'spTYRO · ' + t; };
+
+async function loadModel() {
+  setStatus('loading 0%');
+  const mj = await (await fetch('model.json', { cache: 'no-cache' })).json();
+  const bytes = new Uint8Array(mj.total);
+  let got = 0, base = 0;
+  for (const part of mj.parts) {
+    const res = await fetch(part.file);
+    if (!res.ok) throw new Error(part.file + ' → ' + res.status);
+    let off = base;
+    if (res.body && res.body.getReader) {
+      const rd = res.body.getReader();
+      for (;;) {
+        const { done, value } = await rd.read();
+        if (done) break;
+        bytes.set(value, off); off += value.length; got += value.length;
+        setStatus('loading ' + Math.round((got * 100) / mj.total) + '%');
+      }
+    } else {
+      const ab = new Uint8Array(await res.arrayBuffer());
+      bytes.set(ab, off); off += ab.length; got += ab.length;
+    }
+    if (off - base !== part.size) throw new Error(part.file + ' is incomplete');
+    base += part.size;
+  }
+  setStatus('starting');
+  await tick();
+  const tj = await (await fetch('tok.json')).json();
+  sp = mj.special;
+  bpe = makeBPE(tj, 4);
+  net = new Net(mj.config, parseWeights(mj.config, mj.tensors, bytes));
+  const params = Math.round((mj.total / 2) / 1e5) / 10;
+  setStatus('ready · ' + params + 'M params');
+  input.disabled = false; sendBtn.disabled = false; input.placeholder = 'Ask'; input.focus();
+}
+
+function makeEntry(question) {
+  const el = document.createElement('article'); el.className = 'ex';
+  const q = document.createElement('p'); q.className = 'q'; q.textContent = question;
+  const a = document.createElement('p'); a.className = 'a live';
+  const m = document.createElement('p'); m.className = 'm';
+  el.append(q, a, m);
+  const show = (t) => { a.textContent = t; a.classList.toggle('long', t.length > 22); };
+  return {
+    el,
+    set: show,
+    done(r) {
+      a.classList.remove('live');
+      if (!r.text.trim()) show('(no answer)');
+      m.textContent = r.tokens + (r.tokens === 1 ? ' token · ' : ' tokens · ') + (r.ms / 1000).toFixed(1) + ' s';
+    },
+    fail(e) { a.classList.remove('live'); show('Error'); m.textContent = String(e && e.message || e); },
+  };
+}
+
+async function ask() {
+  const text = input.value.trim();
+  if (!text || busy || !net) return;
+  busy = true; input.value = ''; sendBtn.disabled = true;
+  const empty = $('empty'); if (empty) empty.remove();
+  const ex = makeEntry(text);
+  logEl.prepend(ex.el); logEl.scrollTop = 0;
+  try {
+    ex.done(await generate(net, bpe, sp, text, { temp: mode === 'loose' ? 0.7 : 0, topK: 20, onToken: ex.set }));
+  } catch (e) { ex.fail(e); }
+  busy = false; sendBtn.disabled = false; input.focus();
+}
+
+sendBtn.addEventListener('click', ask);
+input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); ask(); } });
+modeBtn.addEventListener('click', () => {
+  mode = mode === 'precise' ? 'loose' : 'precise';
+  modeBtn.textContent = mode;
+});
+
+loadModel().catch((e) => {
+  setStatus('not loaded');
+  const empty = $('empty');
+  if (empty) empty.textContent = "Can't load the model (" + (e && e.message || e) + "). Put model.json, model.*.bin and tok.json next to this page.";
+});
+</script>
+</body>
+</html>
