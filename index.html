@@ -236,6 +236,66 @@ function pickToken(lg, temp, topK) {
 }
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
+// ---- exact calculator: pure arithmetic questions never reach the model ---------
+function calc(text) {
+  let s = text.toLowerCase().trim();
+  if (/\d{4}-\d{1,2}-\d{1,2}/.test(s)) return null;
+  s = s.replace(/^(what is|what's|whats|how much is|calculate|compute|solve|evaluate|eval)\s+(the\s+)?/, '');
+  s = s.replace(/[?=.\s]+$/, '');
+  s = s.replace(/(\d),(?=\d{3}(\D|$))/g, '$1');
+  s = s.replace(/square root of\s*/g, 'sqrt ').replace(/\bsqrt\s*(\d[\d.]*)/g, 'sqrt($1)');
+  s = s.replace(/multiplied by|\btimes\b/g, '*').replace(/divided by|\bover\b/g, '/')
+       .replace(/\bplus\b/g, '+').replace(/\bminus\b/g, '-').replace(/to the power of/g, '^')
+       .replace(/\bsquared\b/g, '^2').replace(/\bcubed\b/g, '^3').replace(/\bmod\b/g, '%')
+       .replace(/(\d)\s*[x×]\s*(?=[\d(])/g, '$1*').replace(/×/g, '*').replace(/÷/g, '/').replace(/\*\*/g, '^');
+  if (/[^0-9+\-*\/().^%\s]/.test(s.replace(/sqrt/g, ''))) return null;
+  const toks = s.match(/\d+\.?\d*|\.\d+|sqrt|[-+*\/^%()]/g);
+  if (!toks || toks.join('') !== s.replace(/\s/g, '')) return null;
+  let i = 0, usedOp = false;
+  const peek = () => toks[i];
+  function expr() {
+    let v = term();
+    while (peek() === '+' || peek() === '-') { const o = toks[i++], r = term(); v = o === '+' ? v + r : v - r; usedOp = true; }
+    return v;
+  }
+  function term() {
+    let v = unary();
+    while (peek() === '*' || peek() === '/' || peek() === '%') {
+      const o = toks[i++], r = unary(); v = o === '*' ? v * r : o === '/' ? v / r : v % r; usedOp = true;
+    }
+    return v;
+  }
+  function unary() {
+    if (peek() === '-') { i++; return -unary(); }
+    if (peek() === '+') { i++; return unary(); }
+    return power();
+  }
+  function power() {
+    const b = atom();
+    if (peek() === '^') { i++; const e = unary(); usedOp = true; return Math.pow(b, e); }
+    return b;
+  }
+  function atom() {
+    const t = toks[i++];
+    if (t === undefined) throw new Error('end');
+    if (t === '(') { const v = expr(); if (toks[i++] !== ')') throw new Error('paren'); return v; }
+    if (t === 'sqrt') {
+      if (toks[i++] !== '(') throw new Error('sqrt');
+      const v = expr(); if (toks[i++] !== ')') throw new Error('paren');
+      usedOp = true; return Math.sqrt(v);
+    }
+    if (/^[\d.]/.test(t)) return parseFloat(t);
+    throw new Error('token');
+  }
+  let v;
+  try { v = expr(); if (i !== toks.length) return null; } catch (e) { return null; }
+  if (!usedOp) return null;
+  if (!isFinite(v)) return 'Undefined';
+  if (Number.isInteger(v)) return Number.isSafeInteger(v) ? String(v) : null;
+  return String(parseFloat(v.toFixed(6)));
+}
+
+
 async function generate(net, bpe, sp, prompt, o = {}) {
   const maxNew = Math.min(o.maxNew ?? 64, net.c.block_size >> 1), temp = o.temp ?? 0, topK = o.topK ?? 20;
   let ids = [sp.user, ...bpe.encode(prompt.trim()), sp.bot];
@@ -317,7 +377,7 @@ function makeEntry(question) {
     done(r) {
       a.classList.remove('live');
       if (!r.text.trim()) show('(no answer)');
-      m.textContent = r.tokens + (r.tokens === 1 ? ' token · ' : ' tokens · ') + (r.ms / 1000).toFixed(1) + ' s';
+      m.textContent = r.calc ? 'calculated · 0 tokens' : r.tokens + (r.tokens === 1 ? ' token · ' : ' tokens · ') + (r.ms / 1000).toFixed(1) + ' s';
     },
     fail(e) { a.classList.remove('live'); show('Error'); m.textContent = String(e && e.message || e); },
   };
@@ -331,7 +391,9 @@ async function ask() {
   const ex = makeEntry(text);
   logEl.prepend(ex.el); logEl.scrollTop = 0;
   try {
-    ex.done(await generate(net, bpe, sp, text, { temp: mode === 'loose' ? 0.7 : 0, topK: 20, onToken: ex.set }));
+    const exact = calc(text);
+    if (exact !== null) { ex.set(exact); ex.done({ text: exact, tokens: 0, ms: 0, calc: true }); }
+    else ex.done(await generate(net, bpe, sp, text, { temp: mode === 'loose' ? 0.7 : 0, topK: 20, onToken: ex.set }));
   } catch (e) { ex.fail(e); }
   busy = false; sendBtn.disabled = false; input.focus();
 }
